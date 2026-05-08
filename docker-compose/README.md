@@ -1,146 +1,44 @@
-# docker-compose — Multi-service orchestration: what breaks in real stacks
+# docker-compose
 
-Docker Compose is a layer over the Docker API that lets you declare a multi-service
-stack in a single file. Under the hood it's the same `docker run` calls, network
-creates, and volume mounts — just automated. Understanding that mapping is what
-makes failures diagnosable. When a Compose stack breaks, the root cause is almost
-always one of five things: wrong default, missed healthcheck, wrong network scope,
-volume confusion, or port exposure vs publishing.
+## Scenario
 
----
+A three-service stack — nginx + python app + postgres — is deployed for the
+first time. The app exits on startup with a connection error. After fixing that,
+the stack runs, but the next deploy leaves the database empty. Meanwhile, the
+postgres port appears in `docker compose ps` but is unreachable from the host.
 
-## The 5 Problems You'll Actually Hit
+## Diagnosis Flow
 
-### 1. Container exits immediately — no logs, no error
-
-**When it happens:** You run `docker compose up`. One service goes up and immediately
-stops. `docker compose logs` for that service is empty.
-
-```bash
-docker compose up
-# myservice exited with code 0
-
-docker compose logs myservice
-# (empty)
+```
+docker compose up → app exits with code 1
+→ docker compose logs app           # OperationalError: could not connect to server
+→ docker compose ps                 # db shows "Up" — but that means container started, not postgres ready
+→ depends_on with no condition      # starts when container starts, not when pg_isready passes
 ```
 
-**Root cause:** The image has no default `CMD` (or the entrypoint exits cleanly).
-Docker Compose starts the container, the process finishes in milliseconds, and the
-container stops. No process running = no logs.
+After adding healthcheck — stack runs fine. Next deploy:
 
-**Diagnose:**
-
-```bash
-# Check what command the image actually runs
-docker inspect <image> --format '{{json .Config.Cmd}}'
-# null ← no default command
-
-docker inspect <image> --format '{{json .Config.Entrypoint}}'
-# ["sh", "-c", "echo hello"]  ← runs once and exits
+```
+docker compose down && docker compose up
+→ postgres is empty — all data gone
+→ docker volume ls                  # no named volume listed for this project
+→ docker inspect <db_container>     # GraphDriver.Data.UpperDir → destroyed on container remove
 ```
 
-**Fix — specify a command in the Compose file:**
+## Root Cause
 
-```yaml
-services:
-  worker:
-    image: python:3.11-slim
-    command: python -u worker.py    # -u disables output buffering → logs appear
-```
+Two separate problems surfaced in sequence.
 
-**Trap:** Output buffering silences logs even when the process is running.
-Python buffers stdout by default — add `-u` or set `PYTHONUNBUFFERED=1`:
+**Startup race:** `depends_on` without `condition: service_healthy` waits for
+the container process to start — not for postgres to finish initializing its
+data directory and begin accepting connections. The app gets `Connection refused`
+because it won the race against postgres.
 
-```yaml
-services:
-  app:
-    image: python:3.11-slim
-    environment:
-      - PYTHONUNBUFFERED=1
-    command: python app.py
-```
+**Data loss:** Container writes go to the overlay2 writable layer (UpperDir).
+`docker compose down` removes containers and destroys UpperDir with them.
+Without a named volume, every redeploy starts with a blank database.
 
----
-
-### 2. Port not reachable from host — exposed but not published
-
-**When it happens:** The service is running. `docker compose ps` shows it up.
-But `curl http://localhost:6379` or `curl http://localhost:5432` hangs or refuses.
-
-```bash
-docker compose ps
-# redis   running   6379/tcp
-
-curl http://localhost:6379
-# curl: (7) Failed to connect to localhost port 6379
-```
-
-**Root cause:** `6379/tcp` in the PORTS column means the port is exposed
-(documented for inter-container communication) but not published to the host.
-The DNAT iptables rule that makes the host reach the container is only created
-with an explicit port mapping.
-
-**The difference:**
-
-```yaml
-services:
-  redis:
-    image: redis:7
-    expose:
-      - "6379"         # internal only — other containers on same network can reach it
-                       # host CANNOT reach it
-```
-
-vs:
-
-```yaml
-services:
-  redis:
-    image: redis:7
-    ports:
-      - "6379:6379"    # publishes to host — creates DNAT rule
-                       # reachable from host at localhost:6379
-```
-
-**Fix:**
-
-```yaml
-ports:
-  - "6379:6379"                  # host:container
-  - "127.0.0.1:6379:6379"        # localhost only — safer for dev databases
-```
-
-**Trap:** In production, the database port should almost never be published.
-If only the app container needs Redis, `expose` or no mapping at all is
-correct and more secure.
-
----
-
-### 3. App starts before database is ready — `depends_on` without `condition`
-
-**When it happens:** Your app errors on startup with "connection refused" or
-"relation does not exist". Restarting the app manually fixes it.
-
-```bash
-docker compose up
-# app | sqlalchemy.exc.OperationalError: could not connect to server: Connection refused
-# app exited with code 1
-```
-
-**Root cause:** `depends_on` without a condition waits for the container to
-**start**, not for the service inside to be **ready**. Postgres starts fast but
-takes a few seconds to initialize its data directory and accept connections.
-
-**Wrong (default behavior):**
-
-```yaml
-services:
-  app:
-    depends_on:
-      - db          # waits for container start, not for postgres to be ready
-```
-
-**Fix — add a healthcheck and wait for it:**
+## Fix
 
 ```yaml
 services:
@@ -153,226 +51,113 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    volumes:
+      - db-data:/var/lib/postgresql/data   # named volume — survives down
 
   app:
     image: myapp
     depends_on:
       db:
-        condition: service_healthy   # waits until healthcheck passes
-```
-
-**Common healthchecks:**
-
-```yaml
-# PostgreSQL
-test: ["CMD-SHELL", "pg_isready -U postgres"]
-
-# MySQL / MariaDB
-test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-
-# Redis
-test: ["CMD", "redis-cli", "ping"]
-
-# Generic HTTP service
-test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
-```
-
-**Trap:** `depends_on` only helps at startup. The app still needs retry logic
-for when the database restarts during normal operation.
-
----
-
-### 4. Data lost after `docker compose down` — volume confusion
-
-**When it happens:** You bring a stack down and back up. Database is empty.
-Files the app wrote are gone.
-
-```bash
-docker compose down
-docker compose up
-# db is empty — all data gone
-```
-
-**Root cause:** Container writes go to the writable layer (UpperDir in overlay2).
-That layer is destroyed on `docker rm` — and `docker compose down` removes
-containers. Without a named volume, there's nothing persisting the data.
-
-**The three storage options:**
-
-```yaml
-services:
-  db:
-    image: postgres:16
-    volumes:
-      # 1. Named volume — Docker manages the path. Survives down. Only deleted with down -v.
-      - db-data:/var/lib/postgresql/data
-
-      # 2. Bind mount — your host path. Useful for dev (live reload). Not isolated.
-      - ./data:/var/lib/postgresql/data
-
-      # 3. Anonymous volume — no name. Deleted on down -v. Don't use for state.
-      - /var/lib/postgresql/data
+        condition: service_healthy         # waits until healthcheck passes
 
 volumes:
-  db-data:   # declares the named volume
+  db-data:
 ```
 
-**What survives what:**
+## The Critical Trap: `down` vs `down -v`
 
-| Action | Named volume | Bind mount | Anonymous volume |
-|--------|-------------|------------|-----------------|
-| `docker compose down` | ✅ survives | ✅ survives | ✅ survives |
-| `docker compose down -v` | ❌ deleted | ✅ survives (host path) | ❌ deleted |
-| `docker compose rm` | ✅ survives | ✅ survives | ❌ deleted |
+`docker compose down` removes containers but keeps named volumes — data safe.
+`docker compose down -v` removes named volumes too — data gone, no undo.
 
-**Trap:** Volume names are prefixed with the Compose project name (the directory
-name by default). Renaming the directory or using `-p` changes the prefix and
-Compose creates a new empty volume — the old one is orphaned.
+In a production incident, running `down -v` thinking it's a clean restart
+is a data-loss event. The volumes flag is destructive and silent about it.
 
-```bash
-docker volume ls | grep db-data    # find orphaned volumes
-docker volume inspect <project>_db-data
-# "Mountpoint": "/var/lib/docker/volumes/<project>_db-data/_data"
+## Additional Traps from This Lab
+
+### Port listed in `ps` but unreachable — `expose` vs `ports`
+
+```
+docker compose ps → 5432/tcp   ← no host binding shown
+curl localhost:5432             → Connection refused
 ```
 
----
-
-### 5. Service can't reach sibling by hostname — wrong network scope
-
-**When it happens:** Two services are in the same `docker-compose.yml` but
-DNS resolution between them fails.
-
-```bash
-docker compose exec app curl http://cache:6379
-# curl: (6) Could not resolve host: cache
-```
-
-**Root cause:** The services are on different explicitly declared networks and
-share no common network. A container only resolves names of containers on the
-same network.
-
-**Diagnose:**
-
-```bash
-docker network ls | grep <project>
-docker inspect <container> --format '{{json .NetworkSettings.Networks}}' | python3 -m json.tool
-# app is on "frontend" only — cache is on "backend" only — they never share a network
-```
-
-**Fix — ensure shared network membership:**
+`5432/tcp` in the PORTS column means the port is exposed — documented for
+inter-container communication, but not published to the host. The iptables
+DNAT rule that maps `localhost:5432` to the container only exists with an
+explicit `ports:` entry.
 
 ```yaml
-services:
-  app:
-    networks:
-      - frontend
-      - backend     # app bridges both networks — can reach nginx and cache
-
-  cache:
-    networks:
-      - backend     # only reachable from backend
-
-  nginx:
-    networks:
-      - frontend    # only reachable from frontend
-
-networks:
-  frontend:
-  backend:
+ports:
+  - "5432:5432"    # creates DNAT rule — host can reach it
+expose:
+  - "5432"         # documentation only — host cannot reach it
 ```
 
-With this layout `nginx` cannot reach `cache` directly — real L2 isolation via
-separate bridge networks. See [multi-network](./multi-network/) for the full lab.
+In production the DB port should almost never be published. Only add `ports:`
+if the host itself needs to reach the container directly.
 
-**Default network (no explicit networks declared):**
+### Container exits immediately with empty logs
 
-```yaml
-# All services go on <project>_default automatically.
-# All can reach each other by service name. Fine for simple stacks.
-services:
-  app:
-    image: myapp
-  db:
-    image: postgres:16
-# app resolves "db" — both on <project>_default
-```
+Image has no default `CMD`, or the entrypoint runs once and exits cleanly.
+Check with `docker inspect <image> --format '{{json .Config.Cmd}}'`.
+Add `command:` in the Compose file. For Python, also set `PYTHONUNBUFFERED=1`
+or use `python -u` — buffered stdout silences logs even when the process runs.
 
-**Trap:** The project prefix comes from the directory name. Two separate Compose
-projects that need to communicate require an externally-created shared network:
+### Service name DNS fails — services on different networks
 
-```yaml
-networks:
-  shared-net:
-    external: true   # docker network create shared-net beforehand
-```
+A container only resolves names of containers that share the same network.
+If two services can't reach each other by hostname despite being in the same
+`docker-compose.yml`, they are likely on explicitly declared networks with
+no common bridge between them. See [multi-network](./multi-network/) for
+the isolation lab and the fix.
 
----
+## Decision: named volume vs bind mount
 
-## Decision: named volume vs bind mount; expose vs ports
+| | Named volume | Bind mount |
+|---|---|---|
+| Path managed by | Docker (`/var/lib/docker/volumes/`) | You (any host path) |
+| Survives `down` | ✅ | ✅ |
+| Survives `down -v` | ❌ | ✅ (host path untouched) |
+| Portable across hosts | ✅ | ❌ (path must pre-exist) |
+| Use case | DB data, any persistent state | Dev: live code reload (`./src:/app/src`) |
 
-Use **named volumes** for databases and any persistent state. Docker manages
-the path, it survives stack restarts, and it works identically on any host.
+Use named volumes for anything the container owns. Use bind mounts in
+development for files you want to edit on the host and see immediately
+in the container.
 
-Use **bind mounts** in development for live code reload (`./src:/app/src`).
-In production, avoid bind mounts — the path must exist on the host and the
-container gets full access to that host directory.
-
-Use **expose** (or nothing) when a port is only needed between containers.
-Use **ports** only when the host itself needs to reach the container.
-
-Use the **default network** for simple stacks with no isolation requirement.
-Use **explicit networks** when you need certain services unable to reach others.
-
----
-
-## Quick Reference
+## Key Commands
 
 ```bash
 # Lifecycle
-docker compose up -d             # start in background
-docker compose up --build        # rebuild images before starting
-docker compose down              # stop and remove containers
-docker compose down -v           # also remove named volumes
-docker compose restart <service> # restart one service
+docker compose up -d                        # start detached
+docker compose up --build                   # rebuild images first
+docker compose down                         # stop + remove containers, keep volumes
+docker compose down -v                      # also remove named volumes (destructive)
 
-# Logs
-docker compose logs -f           # follow all services
-docker compose logs -f app       # follow one service
-docker compose logs --tail 50    # last 50 lines
+# Logs and status
+docker compose logs -f app                  # follow one service
+docker compose ps                           # status and port bindings
+docker compose top                          # processes inside each container
 
-# Exec and run
-docker compose exec app bash                    # exec into running container
-docker compose run --rm app sh                  # one-off container
+# Debug
+docker compose exec app bash                # exec into running container
+docker compose run --rm app sh              # one-off container (removed after exit)
+docker compose exec app nslookup db         # test DNS between services
 
-# Status and debug
-docker compose ps                               # services and port mapping
-docker compose top                              # processes inside containers
-docker compose exec app nslookup db             # test DNS between services
-docker volume inspect <project>_db-data         # inspect named volume path
-
-# Cleanup
-docker compose down -v                          # stop + remove volumes
-docker volume ls | grep <project>               # find orphaned volumes
-docker volume rm <project>_<name>               # manual delete
+# Volumes
+docker volume ls                            # list all volumes
+docker volume inspect <project>_db-data    # see actual path on host
 ```
-
----
 
 ## K8s Connection
 
-| Docker Compose | Kubernetes equivalent |
-|----------------|----------------------|
-| Named volume | PersistentVolumeClaim |
-| Explicit network | NetworkPolicy |
-| `expose` | ClusterIP Service (internal only) |
-| `ports` | NodePort or LoadBalancer Service |
-| `depends_on: condition: service_healthy` | Init container or readiness probe |
-| Service hostname (`db`, `cache`) | `<svc>.<namespace>.svc.cluster.local` |
-| `docker compose down -v` | `kubectl delete pvc` |
-| Default network (all services reachable) | No NetworkPolicy = pods can reach everything |
+`depends_on: condition: service_healthy` maps directly to a readiness probe on
+the dependency. When the probe passes, the Service starts routing traffic and
+the dependent pod can connect — same contract, different mechanism.
 
-The mental model transfers directly. Named volumes → PVCs: both abstract away
-where the data lives from the workload. Network isolation via explicit networks →
-NetworkPolicy: both enforce which containers can talk to which. Healthcheck
-conditions → readiness probes: both solve "don't route traffic until the backend
-is ready".
+Named volumes map to PersistentVolumeClaims. The abstraction is identical:
+neither the app nor the pod spec knows where the data actually lives on disk —
+both declare what they need, and the runtime (Docker / Kubernetes) provisions it.
+
+`docker compose down -v` is `kubectl delete pvc`: both are permanent and
+both will leave you explaining to stakeholders why the data is gone.

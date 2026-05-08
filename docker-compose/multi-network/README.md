@@ -1,149 +1,175 @@
 # multi-network — L2 isolation with explicit bridge networks
 
-This lab demonstrates that Docker Compose networks are real Linux bridge networks,
-not just logical groupings. Each declared network gets its own bridge interface
-and its own IP subnet. Containers on different bridges can't route to each other
-unless they share a common bridge — that's real L2 isolation at the kernel level,
-not a firewall rule.
+## Scenario
 
-The scenario mirrors a standard three-tier architecture: an `nginx` frontend that
-should never reach the database directly, an `app` that bridges both tiers, and
-a `db` that is invisible to the frontend network.
+A three-tier stack has nginx serving the frontend, an app handling business
+logic, and postgres storing data. The requirement: nginx must never be able
+to reach postgres directly — only the app can talk to the database. A single
+default network puts all three on the same bridge and makes everything
+reachable from everything.
 
----
-
-## Network topology
+## Network Topology
 
 ```
-┌─────────────────────────────┐    ┌──────────────────────────────┐
-│      frontend network       │    │       backend network         │
-│   (172.20.0.0/16 bridge)    │    │   (172.21.0.0/16 bridge)     │
-│                             │    │                              │
-│  ┌─────────┐  ┌──────────┐  │    │  ┌──────────┐  ┌─────────┐  │
-│  │  nginx  │  │   app    │  │    │  │   app    │  │   db    │  │
-│  │ :80     │  │ :8080    │  │    │  │ :8080    │  │ :5432   │  │
-│  └─────────┘  └──────────┘  │    │  └──────────┘  └─────────┘  │
-└─────────────────────────────┘    └──────────────────────────────┘
+┌──────────────────────────────┐    ┌──────────────────────────────┐
+│       frontend network       │    │        backend network        │
+│    (separate Linux bridge)   │    │    (separate Linux bridge)    │
+│                              │    │                              │
+│   ┌────────┐   ┌──────────┐  │    │  ┌──────────┐   ┌────────┐  │
+│   │ nginx  │   │   app    │  │    │  │   app    │   │   db   │  │
+│   │  :80   │   │  :8080   │  │    │  │  :8080   │   │  :5432 │  │
+│   └────────┘   └──────────┘  │    │  └──────────┘   └────────┘  │
+└──────────────────────────────┘    └──────────────────────────────┘
 
-nginx → app   ✅  (same frontend network)
-app   → db    ✅  (same backend network)
-nginx → db    ❌  (different networks — no shared bridge)
+nginx → app   ✅  same bridge (frontend)
+app   → db    ✅  same bridge (backend)
+nginx → db    ❌  different bridges — "db" doesn't even resolve from frontend
 ```
 
-`app` has two network interfaces — one on each bridge. It's the only service
-that can reach both sides. `nginx` and `db` each have one interface and are
-invisible to each other.
+`app` gets two network interfaces — one on each bridge. It is the only service
+that can reach both tiers.
 
----
+## Diagnosis Flow
 
-## Files
+Run the stack, then verify isolation step by step:
 
-- `docker-compose.yml` — the full stack definition
-- `README.md` — this file
-
----
-
-## Run the lab
-
-```bash
-cd multi-network
+```
 docker compose up -d
-docker compose ps
+→ docker compose exec nginx curl http://app:8080     # should succeed
+→ docker compose exec app nc -zv db 5432             # should succeed
+→ docker compose exec nginx nc -zv db 5432           # should FAIL
+→ docker compose exec nginx ping db                  # Name or service not known ← correct behavior
 ```
 
----
+The key observation: `nginx` doesn't get a connection refused — it gets a DNS
+failure. Docker's embedded DNS only returns addresses for containers that share
+a network with the requester. `db` is invisible to the frontend network entirely.
 
-## What to verify
+## Root Cause (of the original single-network problem)
 
-### 1. Confirm the bridges were created
+When no networks are declared, Compose puts all services on one auto-created
+bridge. Every service can resolve every other service by name. There is no
+isolation — nginx can reach postgres directly, which defeats the purpose of
+having separate tiers.
+
+## Fix
+
+```yaml
+services:
+  nginx:
+    image: nginx:alpine
+    networks:
+      - frontend          # frontend only — cannot see backend
+
+  app:
+    image: python:3.11-slim
+    networks:
+      - frontend
+      - backend           # bridges both tiers
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: secret
+    networks:
+      - backend           # backend only — invisible to frontend
+
+networks:
+  frontend:
+  backend:
+```
+
+## The Critical Trap: Project Prefix on Network Names
+
+Compose prefixes network names with the project name (directory name by default).
+Two separate Compose projects cannot share services by hostname unless they
+share an explicitly declared external network.
 
 ```bash
-docker network ls | grep multi-network
-# multi-network_frontend   bridge
-# multi-network_backend    bridge
-
-# Each is a real Linux bridge — inspect the subnet assigned
-docker network inspect multi-network_frontend --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
-docker network inspect multi-network_backend  --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
+docker network ls | grep frontend
+# myproject_frontend   ← not just "frontend"
 ```
 
-### 2. Confirm `app` has two interfaces
+If you need cross-project communication (e.g., a shared database used by two
+separate stacks), create the network externally first:
+
+```bash
+docker network create shared-backend
+
+# In each docker-compose.yml:
+networks:
+  shared-backend:
+    external: true
+```
+
+## Additional Traps from This Lab
+
+### Two interfaces on `app` — verify them
 
 ```bash
 docker compose exec app ip a
-# eth0 → frontend network subnet
-# eth1 → backend network subnet
-# Two interfaces = bridged between both networks
+# eth0 → frontend subnet (e.g., 172.20.0.x)
+# eth1 → backend subnet  (e.g., 172.21.0.x)
 ```
 
-### 3. `nginx` can reach `app` — same network
+Two interfaces confirm the container is bridged between both networks.
+A single interface means a network declaration was missed in the Compose file.
+
+### Host-level bridge confirmation
+
+Each declared network is a real Linux bridge on the host:
 
 ```bash
-docker compose exec nginx curl -s http://app:8080/
-# 200 OK — nginx resolves "app" via Docker's embedded DNS on frontend network
+ip link show type bridge        # two new bridges appear when stack is up
+ip link show type veth          # veth pairs connecting containers to bridges
 ```
 
-### 4. `app` can reach `db` — same network
+## Decision: default network vs explicit networks
+
+Use the **default network** (declare no networks) when all services need to
+reach each other and there is no isolation requirement. Simple dev stacks,
+single-tier apps.
+
+Use **explicit networks** when you need to prevent certain services from
+communicating directly — database not reachable from the public-facing tier,
+monitoring sidecar that shouldn't talk to the app. Each declared network
+creates a separate Linux bridge with its own subnet.
+
+## Key Commands
 
 ```bash
-docker compose exec app nc -zv db 5432
-# db (172.21.x.x:5432) open — app resolves "db" via backend network DNS
-```
+# Run the lab
+docker compose up -d
+docker compose ps
 
-### 5. `nginx` cannot reach `db` — different networks (the important one)
+# Verify topology
+docker compose exec nginx curl -s http://app:8080    # ✅ should work
+docker compose exec app nc -zv db 5432               # ✅ should work
+docker compose exec nginx nc -zv db 5432             # ❌ should fail (Name not known)
 
-```bash
-docker compose exec nginx nc -zv db 5432
-# nc: getaddrinfo for host "db" port 5432: Name or service not known
-# ← DNS for "db" doesn't exist on the frontend network
+# Inspect network membership
+docker inspect <container> --format '{{json .NetworkSettings.Networks}}' | python3 -m json.tool
 
-docker compose exec nginx ping db
-# ping: db: Name or service not known
-```
+# Host-level view
+docker network ls | grep $(basename $(pwd))
+docker network inspect <project>_frontend
 
-This is the point of the lab. `nginx` doesn't just fail to connect — it can't
-even resolve the name `db`. Docker's embedded DNS only responds with addresses
-of containers that share the same network as the requester. The database is
-completely invisible to the frontend tier.
-
-### 6. Observe the host-level bridges
-
-```bash
-# Two separate bridges on the host
-ip link show type bridge | grep -A1 "multi-network"
-
-# The veth pairs connecting containers to each bridge
-ip link show type veth
-
-# No cross-routing between the two subnets
-ip route | grep "172.2"
-```
-
----
-
-## Clean up
-
-```bash
+# Cleanup
 docker compose down
-docker network ls | grep multi-network   # confirm networks were removed
 ```
-
----
 
 ## K8s Connection
 
-This topology maps directly to how Kubernetes NetworkPolicies work with a CNI
-plugin like Calico or Cilium.
-
-In K8s there's one flat network (all pods can reach all pods by default).
-NetworkPolicy is what restricts it:
+This isolation model maps to NetworkPolicy in Kubernetes. In K8s the default
+is the opposite of Compose explicit networks: all pods can reach all other
+pods by default (flat network). NetworkPolicy restricts that:
 
 ```yaml
-# Equivalent of "nginx cannot reach db" — deny ingress to db from frontend pods
+# Equivalent: db only accepts traffic from app tier, not from nginx tier
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: db-deny-frontend
+  name: db-backend-only
 spec:
   podSelector:
     matchLabels:
@@ -152,9 +178,9 @@ spec:
     - from:
         - podSelector:
             matchLabels:
-              tier: backend   # only backend pods can reach db
+              tier: backend
 ```
 
-The mental model is the same: restrict which services can talk to which.
-The implementation differs — Compose uses separate bridges (no shared L2),
-K8s uses iptables/eBPF rules on a flat network. Same result, different mechanism.
+Compose uses separate bridges (no shared L2 = DNS doesn't resolve).
+K8s uses iptables/eBPF rules on a flat network (DNS resolves, but traffic
+is dropped by the kernel before it arrives). Same intent, different mechanism.
