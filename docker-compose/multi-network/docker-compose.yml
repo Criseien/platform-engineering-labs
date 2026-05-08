@@ -1,0 +1,50 @@
+services:
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    networks:
+      - frontend
+    # nginx is on frontend only — it can reach app, it cannot reach db
+
+  app:
+    image: python:3.11-slim
+    command: python -c "
+      import http.server, socketserver
+      handler = http.server.BaseHTTPRequestHandler
+      handler.log_message = lambda *a: None
+      with socketserver.TCPServer(('', 8080), handler) as s:
+          print('app listening on :8080', flush=True)
+          s.serve_forever()
+      "
+    networks:
+      - frontend
+      - backend
+    # app is on BOTH networks — it bridges frontend ↔ backend
+    # two network interfaces: one on each bridge
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: appdb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - backend
+    # db is on backend only — invisible to nginx (frontend network)
+
+networks:
+  frontend:
+    # Compose creates a Linux bridge for this network.
+    # nginx and app get veth pairs attached to this bridge.
+    # db is NOT attached — its name doesn't resolve here.
+
+  backend:
+    # Separate Linux bridge, separate subnet.
+    # app and db get veth pairs attached to this bridge.
+    # nginx is NOT attached — "db" DNS doesn't exist on frontend.
