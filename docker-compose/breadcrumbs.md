@@ -33,3 +33,28 @@
 - named volume different name = different volume = data loss on recreate
 - bind mount on Mac: path lives inside Docker Desktop VM, not visible in Finder
 - -v db-data: /path (space after colon) = syntax error, volume not mounted
+
+## docker security (11 May 2026)
+- 5 isolation layers: namespaces (see), capabilities (do), filesystem (touch),
+  user namespaces (who), seccomp (syscalls)
+- --privileged removes capabilities + seccomp. -v /:/host removes filesystem isolation
+- --cap-drop ALL + --cap-add <specific> = minimum privilege
+- CHOWN capability required for chown on files not owned by process
+- ping works without NET_RAW on modern kernels (ICMP sockets via ping_group_range)
+- user namespaces: --user 1000:1000 maps root inside to unprivileged UID on host
+- seccomp blocks unshare syscall by default — CVE-2022-0185 was blocked this way
+- seccomp=unconfined = open attack surface, same risk as --privileged
+## traps
+- --cap-drop ALL does not block ping on Docker Desktop (ICMP sockets bypass NET_RAW)
+- cannot add port mapping to running container — must recreate
+
+## docker troubleshooting (11 May 2026)
+- logs first: docker logs --tail 50 <id>
+- container not running: docker inspect still works — check Mounts, Env, Config
+- ENOENT on config file: check bind mount source exists on host with ls -la
+- ss -tulnp inside container confirms app listening — separate from host port mapping
+- port in docker ps empty = no -p flag on docker run = DNAT rule missing
+- cannot add -p to running container — workaround: nginx/socat proxy to container IP
+## traps
+- docker ps shows ports only if -p was declared at run time
+- app listening inside container ≠ accessible from outside
